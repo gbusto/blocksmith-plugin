@@ -17,7 +17,7 @@ try {
             variant: 'both'
         };
     
-        const API_BASE = 'http://localhost:8000/api/v0'; // Replace with your backend URL
+        const API_BASE = 'https://api.blocksmithai.com/api/v0'; // Replace with your backend URL
         let apiKey = localStorage.getItem('blocksmith_api_key') || '';
         let dialog;
     
@@ -487,7 +487,15 @@ try {
             }
         };
     
+        // Check if running in web Blockbench (has CORS restrictions)
+        const isWebBlockbench = window.location.hostname === 'web.blockbench.net';
+        
         async function apiCall(endpoint, method, body = null) {
+            // Handle CORS restrictions in web Blockbench
+            if (isWebBlockbench) {
+                throw new Error('BlockSmith plugin requires desktop Blockbench for API access. Web version has CORS restrictions.');
+            }
+            
             const headers = {
                 'Authorization': `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
