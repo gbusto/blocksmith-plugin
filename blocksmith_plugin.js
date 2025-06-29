@@ -194,12 +194,14 @@ try {
                 </style>
                 <div id="bs_tabs">
                    <button id="bs_tab_generate" class="active">Generate</button>
+                   <button id="bs_tab_texture">Texture</button>
                    <button id="bs_tab_list">My Models</button>
                    <button id="bs_tab_settings">Settings</button>
                 </div>
                 <div id="bs_body"></div>
             `;
             contentArea.querySelector('#bs_tab_generate').onclick = ()=> switchTab('generate');
+            contentArea.querySelector('#bs_tab_texture').onclick = ()=> switchTab('texture');
             contentArea.querySelector('#bs_tab_list').onclick    = ()=> switchTab('list');
             contentArea.querySelector('#bs_tab_settings').onclick = ()=> switchTab('settings');
             switchTab('generate');
@@ -216,6 +218,7 @@ try {
             if(name==='generate')buildGenerateTab();
             else if(name==='list')buildListTab();
             else if(name==='settings')buildSettingsTab();
+            else if(name==='texture')buildTextureTab();
         }
     
         function buildGenerateTab(){
@@ -471,6 +474,11 @@ try {
                 const modelData = JSON.parse(modelText);
                 Codecs.project.parse(modelData);
 
+                // ------------------------------------------------------------------
+                //  Auto-unwrap UVs for cubes that don't have any yet.
+                // ------------------------------------------------------------------
+                ensureUVs();
+
                 bar.set(100);
                 setTimeout(() => bar.remove(), 500);
                 Blockbench.showMessageBox({
@@ -487,28 +495,28 @@ try {
             }
         };
     
-        // Check if running in web Blockbench (has CORS restrictions)
-        const isWebBlockbench = window.location.hostname === 'web.blockbench.net';
-        
-        async function apiCall(endpoint, method, body = null) {
-            // Handle CORS restrictions in web Blockbench
-            if (isWebBlockbench) {
-                throw new Error('BlockSmith plugin requires desktop Blockbench for API access. Web version has CORS restrictions.');
-            }
-            
+                async function apiCall(endpoint, method, body = null) {
             const headers = {
                 'Authorization': `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
             };
-    
+
             const options = { method, headers };
             if (body) options.body = JSON.stringify(body);
-    
-            const response = await fetch(`${API_BASE}/${endpoint}`, options);
-            if (!response.ok) {
-                throw new Error(`API error: ${response.status} ${response.statusText}`);
+
+            try {
+                const response = await fetch(`${API_BASE}/${endpoint}`, options);
+                if (!response.ok) {
+                    throw new Error(`API error: ${response.status} ${response.statusText}`);
+                }
+                return response;
+            } catch (error) {
+                // Only throw CORS error if it's actually a CORS-related network error
+                if (error.message.includes('CORS') || error.message.includes('Cross-Origin')) {
+                    throw new Error('CORS error: BlockSmith plugin may require desktop Blockbench for API access. Web version may have CORS restrictions.');
+                }
+                throw error;
             }
-            return response;
         }
     
         async function pollJobStatus(jobId) {
@@ -607,6 +615,7 @@ try {
                 const modelData = JSON.parse(modelText);
                 Codecs.project.parse(modelData);
 
+                ensureUVs();
                 setTimeout(() => bar.remove(), 500);
                 Blockbench.showMessageBox({ title: 'Success', message: 'Model loaded successfully!' });
 
@@ -683,6 +692,218 @@ try {
                 if (blocksmithPanel) blocksmithPanel.delete();
             }
         });
+
+        /**
+         * Ensure every cube in the current project has a non-overlapping Box-UV.
+         * Runs Blockbench's built-in UV generator only for cubes that still lack
+         * a uv_offset property (i.e. freshly imported from our backend).
+         */
+        function ensureUVs() {
+            if (typeof Cube === 'undefined' || !Cube.all) return;
+
+            Cube.all.forEach(cube => {
+                // Skip if cube already has UV mapping
+                if (cube.uv_offset != null) return;
+
+                // Prefer native helper when available (Blockbench ≥4.10)
+                if (typeof cube.generateBoxUV === 'function') {
+                    try {
+                        cube.generateBoxUV({padding: 1});
+                    } catch (e) {
+                        console.warn('[BlockSmith] generateBoxUV failed:', e);
+                    }
+                } else {
+                    // Fallback: execute menu action (older builds)
+                    try {
+                        Blockbench.executeAction('generate_box_uv', {spacing: 1}, cube);
+                    } catch (e) {
+                        console.warn('[BlockSmith] generate_box_uv action failed:', e);
+                    }
+                }
+            });
+        }
+
+        function buildTextureTab(){
+            const body=document.getElementById('bs_body');
+            if(!body)return;
+
+            const apiKeyStatus = apiKey ? 
+                `<div class="bs_credit_info">API Key: ${apiKey.substring(0,8)}... ✅</div>` :
+                `<div class="bs_error">⚠️ No API key set. Go to Settings tab to add your API key.</div>`;
+
+            body.innerHTML=`
+                ${apiKeyStatus}
+                <label>Prompt <input id="bs_texture_prompt" type="text" placeholder="Give it icy runes"></label>
+                <button id="bs_texture_btn" class="bs_button" ${!apiKey ? 'disabled' : ''}>Texture Current Model 🎨</button>
+                <div id="bs_texture_status"></div>
+            `;
+
+            if(apiKey){
+                document.getElementById('bs_texture_btn').onclick=()=>{
+                    textureModel();
+                };
+            }
+        }
+
+        async function textureModel(){
+            const promptElem = document.getElementById('bs_texture_prompt');
+            const statusDiv = document.getElementById('bs_texture_status');
+
+            const prompt = (promptElem?.value || '').trim();
+
+            if (!apiKey){
+                statusDiv.innerHTML = '<div class="bs_error">No API key set</div>';
+                return;
+            }
+            if (!prompt){
+                statusDiv.innerHTML = '<div class="bs_error">Please enter a prompt</div>';
+                return;
+            }
+
+            // Export current project to bbmodel
+            let bbmodelText;
+            try {
+                // Check if we have a project open
+                if (!Project) {
+                    throw new Error('No project is currently open');
+                }
+
+                // Debug: Log what's available
+                console.log('[BlockSmith] Available Codecs:', typeof Codecs !== 'undefined' ? Object.keys(Codecs) : 'Codecs undefined');
+                console.log('[BlockSmith] Project format:', Project.format ? Project.format.id : 'No format');
+
+                // Try multiple approaches to get bbmodel data
+                let bbmodelData;
+                
+                // Method 1: Direct codec access
+                if (typeof Codecs !== 'undefined' && Codecs.bbmodel && typeof Codecs.bbmodel.compile === 'function') {
+                    console.log('[BlockSmith] Using Codecs.bbmodel.compile()');
+                    bbmodelData = Codecs.bbmodel.compile();
+                }
+                // Method 2: Use project codec if it's bbmodel format
+                else if (Project.format && Project.format.codec && typeof Project.format.codec.compile === 'function') {
+                    console.log('[BlockSmith] Using Project.format.codec.compile()');
+                    bbmodelData = Project.format.codec.compile();
+                }
+                // Method 3: Try Blockbench export function
+                else if (typeof Blockbench !== 'undefined' && typeof Blockbench.export === 'function') {
+                    console.log('[BlockSmith] Using Blockbench.export()');
+                    bbmodelData = await new Promise((resolve, reject) => {
+                        Blockbench.export({
+                            type: 'bbmodel',
+                            startpath: '',
+                            content: true
+                        }, (result) => {
+                            if (result) resolve(result);
+                            else reject(new Error('Export returned null'));
+                        });
+                    });
+                }
+                // Method 4: Manual compilation approach
+                else {
+                    console.log('[BlockSmith] Using manual compilation');
+                    // Create a basic bbmodel structure manually
+                    bbmodelData = {
+                        meta: {
+                            format_version: "4.10",
+                            model_format: Project.format ? Project.format.id : "free",
+                            box_uv: Project.box_uv || false
+                        },
+                        name: Project.name || "model",
+                        geometry_name: Project.geometry_name || "",
+                        modded_entity_version: Project.modded_entity_version || "",
+                        visible_box: Project.visible_box || [1, 1, 0],
+                        variable_placeholders: Project.variable_placeholders || "",
+                        variable_placeholder_buttons: Project.variable_placeholder_buttons || [],
+                        unhandled_root_fields: Project.unhandled_root_fields || {},
+                        resolution: {
+                            width: Project.texture_width || 16,
+                            height: Project.texture_height || 16
+                        },
+                        elements: [],
+                        outliner: [],
+                        textures: []
+                    };
+
+                    // Add elements
+                    if (typeof Outliner !== 'undefined' && Outliner.root) {
+                        bbmodelData.outliner = Outliner.root.map(item => item.uuid);
+                    }
+                    if (typeof Cube !== 'undefined' && Cube.all) {
+                        bbmodelData.elements = Cube.all.map(cube => cube.getUndoCopy());
+                    }
+                    if (typeof Texture !== 'undefined' && Texture.all) {
+                        bbmodelData.textures = Texture.all.map(texture => texture.getUndoCopy());
+                    }
+                }
+
+                if (!bbmodelData) {
+                    throw new Error('Failed to generate bbmodel data');
+                }
+
+                bbmodelText = JSON.stringify(bbmodelData);
+                console.log('[BlockSmith] Successfully exported bbmodel data, length:', bbmodelText.length);
+
+            } catch (e) {
+                console.error('[BlockSmith] Export failed', e);
+                statusDiv.innerHTML = `<div class="bs_error">Failed to export current model: ${e.message}</div>`;
+                return;
+            }
+
+            const fd = new FormData();
+            fd.append('prompt', prompt);
+            fd.append('bbmodel_file', new Blob([bbmodelText], {type:'application/json'}), 'model.bbmodel');
+
+            const bar = (typeof Bar !== 'undefined') ? new Bar('blocksmith_texture_progress', {label:'Texturing...', min:0, max:100, value:0}) : createOverlayProgressBar('Texturing...');
+            const stopProgress = startProgressSimulation(bar);
+
+            try {
+                const response = await fetch(`${API_BASE}/texture`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${apiKey}` },
+                    body: fd
+                });
+                if (!response.ok) throw new Error(`API error ${response.status}`);
+                const data = await response.json();
+                const jobId = data.job_id;
+
+                await pollTextureJob(jobId);
+
+                const bbRes = await fetch(`${API_BASE}/texture/${jobId}/bbmodel`, {
+                    headers: { 'Authorization': `Bearer ${apiKey}` }
+                });
+                if (!bbRes.ok) throw new Error('Failed to download textured model');
+                const bbText = await bbRes.text();
+
+                stopProgress(true);
+                await new Promise(r=>setTimeout(r,200));
+
+                newProject('free');
+                Codecs.project.parse(JSON.parse(bbText));
+                ensureUVs();
+                statusDiv.innerHTML = '<div class="bs_success">✅ Textured model loaded!</div>';
+                setTimeout(()=>bar.remove(), 500);
+            } catch(err){
+                console.error('[BlockSmith] Texture job error', err);
+                stopProgress();
+                bar.remove();
+                statusDiv.innerHTML = `<div class="bs_error">${err.message}</div>`;
+            }
+        }
+
+        async function pollTextureJob(jobId){
+            const delay = 5000;
+            const maxAttempts = 60;
+            for(let i=0; i<maxAttempts; i++){
+                const resp = await fetch(`${API_BASE}/texture/${jobId}`, { headers: { 'Authorization': `Bearer ${apiKey}` }});
+                if(!resp.ok) throw new Error(`Status check failed ${resp.status}`);
+                const info = await resp.json();
+                if(info.status === 'completed') return info;
+                if(info.status === 'failed') throw new Error(info.error_message || 'Texture job failed');
+                await new Promise(res=>setTimeout(res, delay));
+            }
+            throw new Error('Texture job timed out');
+        }
     })();    
 } catch (error) {
     console.error('Error in plugin initialization:', error);
